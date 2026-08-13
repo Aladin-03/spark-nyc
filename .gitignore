@@ -1,0 +1,40 @@
+# Data. Fetched by scripts/fetch_data.sh, never committed.
+# Each monthly parquet is 50-60MB; GitHub warns at 50MB and blocks at 100MB.
+# Three months is already 153MB, twelve would be ~700MB and unclonable.
+data/
+!data/**/.gitkeep
+
+# Virtualenv. 512MB of it, and it is machine-specific anyway.
+.venv/
+venv/
+env/
+
+# Spark drops these in the working directory on any SQL/catalog use.
+# All regenerable, all noise.
+spark-warehouse/
+warehouse/
+metastore_db/
+derby.log
+logs/
+*.crc
+_SUCCESS
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+.python-version
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Credentials. Nothing with a key in it goes near this repo.
+*.json.key
+*-key.json
+service-account*.json
+.env
+.env.*

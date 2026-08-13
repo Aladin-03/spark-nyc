@@ -1,0 +1,5 @@
+# Spark 3.5, not 4.x: matches the published Iceberg runtime jar and what
+# employers actually run. Verified on Python 3.11.12, Temurin JDK 17.0.14.
+
+pyspark==3.5.9
+py4j==0.10.9.9
