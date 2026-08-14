@@ -34,24 +34,36 @@ interviewer actually asks about.
 
 ## 2. The shape
 
-```mermaid
-flowchart TD
-    S["0 · SOURCE<br/>NYC TLC website<br/>not ours, changes without warning"]
-    L["1 · LANDING<br/>data/yellow/ · files exactly as downloaded<br/>immutable, never written to"]
-    B["2 · BRONZE<br/>same rows, our storage, plus provenance<br/>nothing dropped, nothing reshaped"]
-    SI["3 · SILVER<br/>one row per trip, trustworthy<br/>cleaned, conformed, zone-enriched"]
-    R["QUARANTINE<br/>data/silver/rejects/<br/>rows that failed a rule, kept not deleted"]
-    G["4 · GOLD<br/>aggregates shaped for a question<br/>many tables, one per question"]
-    C["5 · CONSUMPTION<br/>queries, benchmarks, README numbers"]
-    Q["QUALITY RULES<br/>src/quality/ · pure functions, unit tested<br/>cross-cutting, not a layer"]
-
-    S -->|"scripts/fetch_data.sh"| L
-    L --> B
-    B --> SI
-    SI --> G
-    G --> C
-    SI -.-> R
-    Q -.->|"called by"| SI
+```
+   SOURCE             NYC TLC website. Monthly Parquet + taxi_zone_lookup.csv.
+   layer 0            Not ours. Columns and types change without warning.
+      |
+      |  scripts/fetch_data.sh
+      v
+   LANDING            data/yellow/
+   layer 1            The files exactly as downloaded. Immutable.
+      |               Never written to, so we can always rebuild from source.
+      |
+      v
+   BRONZE             data/bronze/
+   layer 2            Same rows, our storage, plus provenance columns.
+      |               Nothing dropped, nothing reshaped.
+      |
+      v
+   SILVER  - - - - >  QUARANTINE   data/silver/rejects/
+   layer 3                         Rows that failed a rule. Kept, not deleted.
+      |
+      |               One row per trip, trustworthy.
+      |               Cleaned, conformed, zone-enriched.
+      |               Rules live in src/quality/ as pure functions, unit tested.
+      v
+   GOLD               data/gold/
+   layer 4            Aggregates shaped for a question.
+      |               Many tables, one per question. No cleaning here.
+      |
+      v
+   CONSUMPTION        Queries, benchmarks/, and the README results table.
+   layer 5            What an interviewer opens first.
 ```
 
 ---
