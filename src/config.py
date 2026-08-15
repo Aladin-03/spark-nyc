@@ -27,6 +27,11 @@ GOLD = DATA / "gold"
 # column the TLC might add to the source one day.
 COL_SOURCE_FILE = "_source_file"
 COL_INGESTED_AT = "_ingested_at"
+COL_BATCH_ID = "_batch_id"
+
+# Partition columns. Derived from the source filename, never from the row's own
+# timestamp: the March file genuinely contains trips dated 2009.
+PARTITION_COLS = ["year", "month"]
 
 _MONTH_FILE = re.compile(r"yellow_tripdata_(\d{4})-(\d{2})\.parquet$")
 
