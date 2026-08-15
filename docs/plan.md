@@ -252,20 +252,32 @@ is where H3 stops being decoration and becomes the mechanism.
 
 ---
 
-## 7. Mistakes planted on purpose
+## 7. Predictions, not planted mistakes
 
-None get fixed on the way in. Build it, run three months, scale to twelve, watch it
-degrade, diagnose it in the Spark UI, then fix it and record the number.
+**Build every layer as correctly as you know how.** Nothing here is sabotage.
 
-| Layer | Planted mistake | What it teaches when it breaks |
+Deliberately planting a bug teaches you only that a mistake you already knew about
+produced the outcome you were already told to expect. That is theatre. The learning
+lives in the gap between what you predicted and what the Spark UI actually shows,
+and that gap only exists if you were honestly trying to get it right.
+
+So: build it properly, write the prediction down, run three months, scale to twelve,
+watch what degrades, diagnose it in the UI, then fix it and record the number. Some
+of these will happen anyway despite your best effort, which is the point.
+
+| Layer | Prediction | What it teaches if it happens |
 |---|---|---|
-| Bronze | Append, no idempotency | Re-running duplicates everything. Why Iceberg MERGE exists |
-| Bronze | No control over output file count | Becomes a file count problem at twelve months |
-| Silver | Plain join on the zone lookup | Sort-merge join where broadcast was obvious |
-| Silver | Drop bad rows instead of quarantining | Cannot answer "how much did we throw away" |
-| Gold | Default 200 shuffle partitions | Tiny output files. Already have the table that fixes it |
-| Gold | Aggregate on a skewed key | One task at 30x the median. The war story |
-| Gold | Read silver repeatedly, no caching | Recomputing the same work |
+| Bronze | Output file count grows with nothing controlling it | Becomes a small-file problem at twelve months |
+| Bronze | The schema check reads more than it needs to | Reading a footer is not reading a file |
+| Silver | The zone-lookup join plans as sort-merge, not broadcast | When the optimiser needs telling, and how to see which it chose |
+| Silver | Reject counting costs a second full pass | Doing quality checks in one pass instead of two |
+| Gold | Default 200 shuffle partitions produce tiny output files | You already have the tuning table from day 2 |
+| Gold | Aggregating on pickup zone is skewed | One task at 30x the median. ⭐ The war story |
+| Gold | Silver gets read repeatedly with no caching | When caching pays and when it costs |
+
+Record the outcome next to each. **A prediction that turned out wrong is the most
+valuable row in this table**, because it is the only one that told you something you
+did not already believe.
 
 ---
 

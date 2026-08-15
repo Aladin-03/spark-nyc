@@ -30,6 +30,15 @@ Three properties define a good bronze layer, in any company, on any stack:
 
 Almost every real bronze bug is one of those three failing.
 
+> **Idempotency is a property of the result, not of the run.** A job that succeeds
+> twice and doubles the row count succeeded twice and is not idempotent.
+>
+> The related but separate property is **atomicity**: either the whole write lands or
+> none of it does. A crash halfway through a Parquet write leaves half the files
+> behind, which is a failure of atomicity, not of idempotency. Parquet directories do
+> not give you atomicity. Iceberg does, because nothing is visible until the commit.
+> Keep the two words apart.
+
 ### The names you will hear for it
 
 Bronze, raw, staging, landing zone, ODS (older warehouses), L0. Not identical in
@@ -95,11 +104,38 @@ is, so nothing is lost in conversion.
 
 ### Partitioning
 
+**First, four different things get called a "partition".** They are at four
+different levels and confusing them is the most common way to misread a Spark job.
+
 ```
-data/bronze/yellow/year=2024/month=1/part-00000.parquet
-                            month=2/part-00000.parquet
-                            month=3/part-00000.parquet
+  1. TABLE PARTITION           data/bronze/yellow/year=2024/month=03/
+     directories on disk          ^ a FOLDER. This is what "partition by" means.
+
+  2. FILES in that partition      part-00000.parquet   part-00001.parquet
+     one per writing task         ^ just files. NOT separate partitions.
+
+  3. ROW GROUPS inside a file     [rows 0-1M][rows 1M-2M][rows 2M-3M]
+     ~128 MB blocks, each with    ^ a logical boundary INSIDE one file.
+     min/max stats per column
+
+  4. SPARK PARTITION              the slice one task holds in memory
+     the unit of parallelism      ^ exists only while the job runs.
+                                    This is df.rdd.getNumPartitions().
 ```
+
+Two different skipping mechanisms come out of this, one per level:
+
+| Name | Level | How it works |
+|---|---|---|
+| **Partition pruning** | 1, folders | `WHERE month = 3` and the planner never lists the other folders. Decided before a single file is opened |
+| **Predicate pushdown** | 3, row groups | `WHERE fare > 100` reads the Parquet footer stats and skips row groups whose maximum fare is 50 |
+
+Pruning only fires if you filter **on the partition column**. Filtering on
+`tpep_pickup_datetime` will not prune a `month=` partition, because Spark has no idea
+the two are related.
+
+"Physical separation" means **folders**. Different months are different directories.
+Multiple `part-*` files in one directory are parallel write output, not separation.
 
 **Decision: partition by `year` and `month`.**
 
@@ -125,6 +161,19 @@ Why **not** unpartitioned: every query reads every file. No pruning at all.
 > string, and then filters have to compare strings. Pick one and be consistent.
 
 ### Where the partition values come from
+
+Mechanically, a partition value **always comes from a column**. `partitionBy("year",
+"month")` requires those columns to exist. Spark builds the folder name from the
+value and then **strips the column out of the file contents**, because the path
+already encodes it, and reconstructs it from the path on read.
+
+```
+  SOURCE FILENAME                  →   COLUMN        →   DIRECTORY
+  yellow_tripdata_2024-03.parquet      year  = 2024      year=2024/
+                                       month = 3         month=3/
+```
+
+The design decision is where those columns get their values.
 
 **From the filename, not from the row's pickup timestamp.**
 
@@ -159,6 +208,16 @@ constantly.
 **Why `_batch_id` matters:** it is the handle for undoing one bad run. Without it,
 "delete everything the broken job wrote" has no `WHERE` clause.
 
+> ⚠️ **A batch is not a Spark job.** Spark's job id is internal and dies with the
+> session, so job 7 today is a different job 7 tomorrow and nothing outside the UI
+> can use it. A **batch** is one logical run of *your* pipeline over a defined input,
+> and you generate its id yourself at the start of the run and write it into the
+> data. Here, a UTC timestamp. In production, the orchestrator's run id, which for
+> Airflow is the `run_id` of the DAG run.
+>
+> `_ingested_at` is close but not equal: a run that takes forty minutes writes many
+> different timestamps while sharing one batch id.
+
 > `input_file_name()` works on file-based sources in Spark 3.5. It returns the full
 > URI, so it is long and repetitive, but Parquet dictionary-encodes it and the cost
 > is close to nothing.
@@ -176,8 +235,37 @@ that can.**
 | **Expected column missing** | **Fail the job** | It becomes NULL downstream, and in this domain NULL is a real business value, so the corruption is invisible |
 | **Type changed** (int → string) | **Fail the job** | Spark will coerce silently. `"12"` and `12` compare differently and no error is raised |
 | **Column renamed** | **Fail the job** | Reads as a delete plus an add. Needs a human decision |
-| **Column order changed** | Ignore | Parquet is name-addressed, not position-addressed |
+| **Column order changed** | Ignore, **but see below** | Parquet is name-addressed, not position-addressed |
 | **Nullability changed** | Accept, log it | Cannot corrupt values. Worth knowing about |
+
+> ⚠️ **"Ignore reorder" is only safe if nothing in the pipeline reads by position.**
+> `df1.union(df2)` matches columns **by position** and will silently swap your data
+> when a source reorders. `df1.unionByName(df2)` matches by name. Same for
+> `toDF(*names)`, which renames positionally. **Ban positional operations in this
+> project.** This is the Spark version of the ordinal breakage you get feeding a
+> reordered Postgres table into a BI tool, and the fix is the same: address by name.
+
+**Why not just read everything as a string?** Because it depends on the source:
+
+| Source | Right answer |
+|---|---|
+| CSV, JSON, an API | String in bronze, cast in silver. There were no real types to begin with, so parsing is already an interpretation, and interpretations belong in silver |
+| **Parquet, ours** | Keep the source types. They came with the file |
+
+Forcing our Parquet to string **would be reshaping**, and it breaks the one rule of
+this layer. Nulls are not a reason to do it: Parquet represents null natively, it
+never needs the string `"NULL"`.
+
+**On nullability.** If you assert a column is non-null and the source sends null,
+yes, the job must fail. But two caveats. First, Spark's Parquet reader marks almost
+everything nullable on read regardless of what the file says, so you cannot rely on
+comparing the flags, it has to be an explicit check you write. Second, and more
+important: **null checks mostly do not belong here at all.** Bronze judges structure,
+does the column exist and is it the right type. Silver judges values. The difference
+matters because bronze can only crash, whereas silver can quarantine forty bad rows
+and keep three million good ones.
+
+> **Bronze fails on shape. Silver quarantines on content.**
 
 ### Why "fail loudly" beats "handle it gracefully"
 
@@ -208,19 +296,21 @@ and every downstream number is silently inflated.
 
 Four approaches, in increasing order of sophistication.
 
-### A. Append, no check ⚠️ what we build first
+### A. Append, no check ⚠️ the broken one
 
 ```python
 df.write.mode("append").partitionBy("year", "month").parquet(path)
 ```
 
-Run March twice and every March row exists twice. No way to fix it except deleting
-directories by hand.
+Run March twice and every March row exists twice. No error, no warning, and the only
+fix is deleting directories by hand.
 
-**We build this on purpose.** Doing it and then watching your row count double is
-worth more than reading about it. Planted mistake number one.
+**Do this once in the notebook, not in the pipeline.** Write March, count, write
+March again, count again. Seeing 5.9 million where 3.0 million belongs is worth two
+minutes. Then delete it and build B properly. The pipeline itself is built correctly
+from the first commit.
 
-### B. Dynamic partition overwrite
+### B. Dynamic partition overwrite ⭐ what we build
 
 ```python
 spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
@@ -234,6 +324,10 @@ alone. Re-running March overwrites March and does not touch January.
 - Requires the unit of reprocessing to line up exactly with the partition key
 - Not atomic: a crash mid-write can leave a partition half-replaced
 
+> ⚠️ **Without that config line, `mode("overwrite")` deletes the entire table** and
+> leaves only March behind. The default is `static`. This is the most destructive
+> default in Spark and it is worth remembering on its own.
+
 ### C. A processed manifest
 
 Keep a small record of which source files have been loaded. Check it at the start of
@@ -243,26 +337,29 @@ every run and skip what is already there.
 - Handles the case where the same file is republished with new content, via a hash
 - Extra state you now have to keep correct, and it can drift from reality
 
-### D. Iceberg `MERGE INTO` ⭐ the real answer
+### D. Iceberg atomic partition replacement ⭐ phase 2
+
+What bronze wants from Iceberg is **not** row-level `MERGE INTO`. It is B, made
+atomic and given a memory:
 
 ```sql
-MERGE INTO bronze.yellow t
-USING updates s
-ON t.trip_id = s.trip_id
-WHEN MATCHED THEN UPDATE SET *
-WHEN NOT MATCHED THEN INSERT *
+REPLACE PARTITIONS  -- one commit. Either all of March is replaced, or none of it is.
 ```
 
-- Genuinely idempotent, at row level
-- **Atomic.** A failed job commits nothing; readers keep seeing the previous snapshot
-- Needs a real key, which this dataset does not have out of the box
+- **Atomic.** A failed job commits nothing, readers keep seeing the previous snapshot
+- **Historied.** Every write is a snapshot you can inspect, diff and roll back to
+- No extra state to maintain, because the table maintains it
 
-> ⚠️ **NYC trip records have no primary key.** No trip ID, no medallion number in
-> the 2024 files. So a row-level MERGE needs a synthetic key, usually a hash of the
-> columns that together identify a trip. That is itself a design decision, and it is
-> in silver's document because it is a reshaping choice.
+> ⚠️ **`MERGE INTO` is a different tool and this dataset cannot use it cleanly.**
+> MERGE matches incoming rows to existing rows **on a key**, and NYC trip records
+> have no key: no trip ID, no medallion number in the 2024 files. Inventing one from
+> a column hash is a judgement call, so it lives in silver. MERGE is the right answer
+> for CDC and for slowly changing dimensions, which is where you should reach for it
+> in an interview, not here.
 
-**Our sequence: A, then B, then D.** Each step because the previous one hurt.
+**Our sequence: B on plain Parquet, then D on Iceberg.** A gets demonstrated once in
+the notebook. C is understood and skipped, because our filenames already tell us
+which month a file holds.
 
 ---
 
@@ -272,6 +369,22 @@ WHEN NOT MATCHED THEN INSERT *
 
 The instinct to keep months separate is right. The mechanism of separate tables is
 wrong.
+
+**One partitioned table does not mean one file.** This is the fear worth killing
+before it takes hold:
+
+```
+  ONE TABLE, PARTITIONED              ONE TABLE PER MONTH
+  data/bronze/yellow/                 bronze.yellow_2024_01
+    year=2024/                        bronze.yellow_2024_02
+      month=01/  part-00000.parquet   bronze.yellow_2024_03
+      month=02/  part-00000.parquet    ^ three names to register,
+      month=03/  part-00000.parquet      three schemas that can drift,
+   ^ ONE name. THREE folders.            a UNION in every query.
+```
+
+All of 2024 stays in twelve separate folders. You get the separation *and* the single
+table. The per-month option gives you the separation and takes the table away.
 
 | | One table, partitioned | One table per month |
 |---|---|---|
@@ -318,7 +431,37 @@ all read the same table.** That is the argument for it over a vendor format.
 | **Snapshots** | Every write creates a version. "What did this look like last Tuesday" becomes a query |
 | **Atomic commits** | A failed job commits nothing. Readers never see a half-written table |
 | **Schema evolution** | Adding a column is a metadata change, tracked with a version. No rewrite |
-| **`MERGE INTO`** | Real idempotency, at row level |
+| **Partition replacement** | Replace all of March in one commit, atomically |
+
+### What lives where, and what a snapshot actually is
+
+You declare two things once, at `CREATE TABLE`: the **schema** and the **partition
+spec**. Iceberg maintains everything below from then on. You never hand-write a
+manifest.
+
+| File | Holds |
+|---|---|
+| `v3.metadata.json` | Current table state: **every schema version**, every partition spec, the **full list of snapshots**, and a pointer to the current one |
+| `snap-<id>-...avro` | A **manifest list**: which manifest files make up that one snapshot |
+| `<uuid>-m0.avro` | A **manifest**: which data files, their partition values, row counts, per-column min/max |
+| `data/**.parquet` | The rows |
+
+**A snapshot is not one line in a log.** It is an entry in the snapshot list inside
+`metadata.json` (id, parent id, timestamp, operation such as `append` or `overwrite`,
+and summary counts) *plus* the `snap-*.avro` manifest list enumerating every file the
+table consisted of at that instant.
+
+**Time travel is not stored anywhere separately.** That is the part worth
+internalising. Reading an old snapshot means reading its old manifest list, which
+still points at data files nobody deleted. Time travel is free because nothing was
+thrown away. The cost is storage, and the operation that reclaims it is **expiring
+snapshots**, which deletes the orphaned files and ends your ability to travel back
+past that point. Schema history lives in `metadata.json` too, as a list of schemas
+with ids, and each snapshot records which schema id it was written under. That is how
+one table holds files with different columns and still reads as one thing.
+
+Open `v1.metadata.json` in a text editor the first afternoon you have a real table.
+It is plain JSON and it teaches more than this section does.
 
 ### Time travel, once it is in
 
@@ -368,24 +511,37 @@ instead, because a hadoop catalog cannot safely handle concurrent writers.
 
 | # | Decision | Chosen | Rejected, and why |
 |---|---|---|---|
-| 1 | Idempotency | Append first, then dynamic partition overwrite, then Iceberg MERGE | Going straight to MERGE. The failure has to happen once to mean anything |
+| 1 | Idempotency | Dynamic partition overwrite, then Iceberg atomic replace | Naive append (duplicates silently); row-level `MERGE INTO` (needs a key this data has not got); a processed manifest (state to maintain, and the filename already tells us the month) |
 | 2 | Partitioning | `year` + `month` | By day (too many small files), by zone (high cardinality), none (no pruning) |
 | 3 | Partition values from | The filename | The pickup timestamp: that is a reshaping decision and belongs to silver |
 | 4 | Schema drift | Accept additive, fail on missing / retyped / renamed | Auto-merging everything: it hides corruption |
 | 5 | Table layout | One table, partitioned | One table per month: needs a UNION per query and fragments the schema |
-| 6 | Format | Parquet first, Iceberg second | Iceberg first: then you never learn what it is solving |
+| 6 | Format | Parquet first, Iceberg second | Iceberg first: then you never learn what it is solving. ORC and Avro: equivalent or row-based, no advantage here |
+| 6b | Positional operations | Banned. `unionByName`, never `union` | `union` matches by column position, so a reordered source silently swaps your data |
 | 7 | Cleaning | None here at all | Dropping obvious garbage early: destroys the evidence |
 | 8 | Provenance | `_source_file`, `_ingested_at`, `_batch_id` | None: makes every later question unanswerable |
 
 ---
 
-## 10. Mistakes planted in this layer
+## 10. Where this will break, predicted in advance
 
-| Mistake | When it will bite | What fixes it |
+**Nothing here is sabotage.** Build this layer as correctly as you know how. The
+point of the table is that you write down what you expect to go wrong *before* you
+scale up, and then find out whether you were right.
+
+Deliberately planting a bug only teaches you that a mistake you already knew about
+produced the outcome you were already told to expect. The learning is in the gap
+between what you predicted and what the Spark UI actually shows, and that gap only
+exists if you were honestly trying to get it right.
+
+| Prediction | When it should bite | What you think will fix it |
 |---|---|---|
-| Append with no idempotency | The first time you rerun a month | Dynamic partition overwrite, then Iceberg MERGE |
-| No control over output file count | At twelve months, and worse in gold | `coalesce` before write, or shuffle partition tuning |
-| `count()` before every write | When ingestion becomes the slow part | Take the count from write metrics instead of a separate pass |
+| Output file count grows with no control | At twelve months, worse in gold | `coalesce` before write, or shuffle partition tuning |
+| A separate `count()` before every write doubles the work | When ingestion becomes the slow part | Take the count from write metrics instead of a second pass |
+| Schema check reads the whole file instead of the footer | When a month is 5 GB rather than 50 MB | Read the schema without reading the data |
+
+Fill in what actually happened next to each one. A wrong prediction is the most
+useful row in this table.
 
 ---
 
@@ -402,7 +558,9 @@ Work out, with the data in front of you and the Spark UI open:
 - Write it partitioned. Look at the directory tree that comes out.
 - Count the output files. Does the number match what the partition formula predicts?
 - Read it back and confirm the row count survived.
-- **Then run the whole thing twice and watch the row count double.**
+- **One throwaway cell: append the same month twice and count.** See 5.9 million
+  where 3.0 million belongs, then delete the directory. That is the whole reason
+  the module gets built with dynamic partition overwrite from its first line.
 
 **Step 2, module** (`src/bronze/ingest.py`)
 
@@ -424,8 +582,9 @@ README results table.
 - [ ] The row count in bronze equals the row count in the source, exactly
 - [ ] A missing or retyped column fails the job with a readable message
 - [ ] Every row can be traced to its source file and its load time
-- [ ] **You have run it twice and seen the duplication with your own eyes**
-- [ ] Section 9 matches what you actually built
+- [ ] **Running `python -m src.bronze.ingest` twice leaves the row count unchanged**
+- [ ] You have seen the duplicate-append failure once, in the notebook, and deleted it
+- [ ] Section 9 matches what you actually built, and section 10 has real outcomes in it
 
 ---
 
