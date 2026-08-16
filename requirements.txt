@@ -7,3 +7,18 @@ py4j==0.10.9.9
 # Runs the notebooks in notebooks/. VS Code needs only the kernel, not a
 # full JupyterLab install.
 ipykernel==7.3.0
+
+# ---------------------------------------------------------------------------
+# NOT installable with pip: Iceberg is a JVM library, not a Python package.
+#
+#   org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.11.0
+#
+# Pinned in src/session.py as ICEBERG_VERSION and pulled by Ivy on the first
+# get_spark(iceberg=True) call, into ~/.ivy2/. Roughly 30 MB, once.
+#
+# The 3.5 in the artifact name must match the pyspark version above, and the
+# 2.12 is Spark 3.5's Scala version. Bumping pyspark means bumping both.
+#
+# Offline or air-gapped: download the jar and use spark.jars instead of
+# spark.jars.packages.
+# ---------------------------------------------------------------------------
