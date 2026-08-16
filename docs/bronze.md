@@ -2,6 +2,9 @@
 
 > Parent: [`plan.md`](plan.md) · Next: `silver.md`
 >
+> **The order this layer gets built in is the general one: [`method.md`](method.md).**
+> This document is the bronze-specific content that fills it in.
+>
 > Every decision made in this layer is recorded here, with the reasoning and the
 > option that was rejected. Six months from now the reasoning is the part you will
 > have forgotten.

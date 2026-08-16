@@ -5,7 +5,7 @@
 > Each layer has its own document with the detail and the decisions made inside it:
 > Layers: [`bronze.md`](bronze.md) · `silver.md` · `gold.md`
 >
-> Vocabulary and mechanics: [`concepts.md`](concepts.md)
+> How to build any layer: [`method.md`](method.md) · Vocabulary: [`concepts.md`](concepts.md)
 
 ---
 
