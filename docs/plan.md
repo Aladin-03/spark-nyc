@@ -3,7 +3,9 @@
 > The map. Read this before starting any layer.
 >
 > Each layer has its own document with the detail and the decisions made inside it:
-> [`bronze.md`](bronze.md) · `silver.md` · `gold.md`
+> Layers: [`bronze.md`](bronze.md) · `silver.md` · `gold.md`
+>
+> Vocabulary and mechanics: [`concepts.md`](concepts.md)
 
 ---
 
